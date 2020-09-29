@@ -73,7 +73,27 @@ int main()
 		vfs.Copy("tmp", "usr/tmp_copy");
 	}
 
-	PrintDirs(vfs, "/");
+	auto fs = vfs.Open("/tmp/Test.txt", VFS::FileMode::RW);
+	fs->WriteLine("Hello World!");
+
+	// PrintDirs(vfs, "/");
+
+	auto strm = vfs.Serialize();
+	ofstream out("fs.cvfs", ios::binary);
+	if(out.is_open())
+	{
+		out.write(strm.data(), strm.size());
+		out.close();
+	}
+
+	VFS::CVFS vfs2;
+	vfs2.Deserialize(strm);
+
+	cout << "-----------ORIG-----------" << endl;
+	PrintDirs(vfs2, "/");
+
+	cout << "-----------Copy-----------" << endl;
+	PrintDirs(vfs2, "/");
 
 	return 0;
 }

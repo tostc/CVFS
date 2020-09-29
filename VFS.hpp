@@ -54,7 +54,9 @@ namespace VFS
         NODE_IS_FILE,
         NODE_IS_DIR,
         NODE_ALREADY_EXISTS,
-        NODE_DOESNT_EXISTS
+        NODE_DOESNT_EXISTS,
+        FAILED_TO_READ_STREAM,
+        CANT_CREATE_FILESYSTEM
     };
 
     enum class FileMode
@@ -437,8 +439,92 @@ namespace VFS
                 DestParent->AppendChild(copy);
             }
 
+            /**
+             * @return Returns the complete filesystem as stream.
+             * 
+             * @attention This function allocates new memory for saving the filesystem.
+             * @throw Throws a CVFSException on out of memory.
+             */
+            std::vector<char> Serialize()
+            {
+                try
+                {
+                    VFSFile Disk = VFSFile(new CVFSFile("stream"));
+                    Disk->Clear();
+                    Disk->Write(MAGIC.data(), MAGIC.size());
+
+                    uint64_t Entries = m_Root->GetChilds().size();
+                    Disk->Write((char*)&Entries, sizeof(Entries));
+                    FillSpace(Disk.get(), DISK_CHUNK_SIZE - (MAGIC.size() + sizeof(Entries)));
+
+                    auto Childs = m_Root->GetChilds();
+                    for (auto e : Childs)
+                        SerializeNode(Disk.get(), e.get());
+
+                    std::vector<char> Ret;
+                    Ret.resize(Disk->Size());
+                    Disk->Read(&Ret[0], Disk->Size(), 0);
+                    return Ret;
+                }
+                catch(const std::bad_alloc &e)
+                {
+                    throw CVFSException("Can't create stream. Out of mem. bad_alloc: " + std::string(e.what()), VFSError::OUT_OF_MEM);
+                }
+            }
+
+            /**
+             * @return Returns the complete filesystem as stream.
+             * 
+             * @attention This function allocates new memory for saving the filesystem.
+             * @throw Throws a CVFSException on out of memory.
+             */
+            void Deserialize(const std::vector<char> &Data)
+            {
+                try
+                {
+                    size_t Pos = 0;
+                    uint64_t Entries = 0;
+                    std::string FileMagic;
+                    FileMagic.resize(MAGIC.size());
+
+                    ReadVector(Data, &FileMagic[0], FileMagic.size(), Pos);
+                    if(FileMagic != MAGIC)
+                        throw CVFSException("Can't create filesystem.", VFSError::CANT_CREATE_FILESYSTEM);
+
+                    ReadVector(Data, (char*)&Entries, sizeof(Entries), Pos);
+
+                    //Skips the sector.
+                    Pos += (DISK_CHUNK_SIZE - (MAGIC.size() + sizeof(Entries)));
+
+                    for (size_t i = 0; i < Entries; i++)
+                        m_Root->AppendChild(DeserializeNode(Data, Pos));
+                
+                    // SerializeNode(Disk.get(), m_Root.get());
+                }
+                catch(const std::bad_alloc &e)
+                {
+                    throw CVFSException("Can't create filesystem. Out of mem. bad_alloc: " + std::string(e.what()), VFSError::OUT_OF_MEM);
+                }
+            }
+
+            size_t ReadVector(const std::vector<char> &Data, char *Buf, size_t Size, size_t &Pos)
+            {
+                size_t CopyCount = (Pos + Size) < Data.size() ? Size : (Data.size() - Pos);
+                if(CopyCount > Data.size())
+                   throw CVFSException("Can't create filesystem.", VFSError::FAILED_TO_READ_STREAM);
+
+                memcpy(Buf, Data.data() + Pos, CopyCount);
+                Pos += CopyCount;
+
+                return CopyCount;
+            }
+
             ~CVFS() {}
         private:
+            const std::string MAGIC = "CVFS-DISK";
+            const int DISK_CHUNK_SIZE = 128;
+            const std::string NODE_IDENTIFIER = "NODE";
+
             class CVFSFile;
             class CVFSDir;
 
@@ -447,6 +533,8 @@ namespace VFS
             
             class CVFSFile : public CVFSNode
             {
+                friend CVFS;
+
                 public:
                     CVFSFile() : CVFSNode()
                     {
@@ -502,7 +590,7 @@ namespace VFS
 
                         //Calculates the chunk count which is needed to save the data.
                         size_t ChunkCount = Size / CHUNK_SIZE + ((Size % CHUNK_SIZE > 0) ? 1 : 0);
-                        if((m_Size == (m_Data.size() * CHUNK_SIZE)))    //Allocate new chunks, if we are exhausted.
+                        if(((m_Size + Size) >= (m_Data.size() * CHUNK_SIZE)))    //Allocate new chunks, if we are exhausted.
                             ReserveChunks(ChunkCount);
 
                         size_t Written = 0;
@@ -512,7 +600,7 @@ namespace VFS
                         {
                             Chunk c = m_Data[ChunkPos];
                             size_t Free = c->Size - c->Filled;
-                            size_t CopyCount = (Size >= Free) ? Free : Size;    //Calculate the right copy size.
+                            size_t CopyCount = ((Size - Written) >= Free) ? Free : (Size - Written);    //Calculate the right copy size.
 
                             memcpy(c->Data + c->Filled, Data + Written, CopyCount);
                             c->Filled += CopyCount; //Chunk update
@@ -548,6 +636,8 @@ namespace VFS
 
                             Chunk c = m_Data[ChunkPos];
                             size_t Pos = CurPos - ChunkPos * CHUNK_SIZE;
+                            Pos = (Pos > CHUNK_SIZE) ? 0 : Pos;
+
                             int CopyCount = c->Filled - Pos;
                             CopyCount = CopyCount > Size ? Size : CopyCount;    //Calculate the right copy size.
                             if(CopyCount <= 0)
@@ -848,7 +938,160 @@ namespace VFS
 
                 return Path.substr(Pos + 1, End - Pos);
             }
+
+            /**
+             * @brief Fills in padding bytes inside the file.
+             */
+            void FillSpace(CVFSFile *file, size_t Count)
+            {
+                for (size_t i = 0; i < Count; i++)
+                {
+                    char c = 0;
+                    file->Write(&c, sizeof(c));
+                }
+            }
             
+            void SerializeNode(CVFSFile *file, CVFSNode *Node)
+            {
+                size_t NodeSize = NODE_IDENTIFIER.size() + sizeof(int) + (int)Node->m_Name.size() + sizeof(Node->m_IsDir) + sizeof(Node->m_Created) + sizeof(Node->m_Accessed);
+                file->Write(NODE_IDENTIFIER.data(), NODE_IDENTIFIER.size());
+
+                //Writes all base node informations.
+                int NameSize = Node->m_Name.size();
+                file->Write((char*)&NameSize, sizeof(int));
+                file->Write(Node->m_Name.data(), NameSize);
+                file->Write((char*)&Node->m_IsDir, sizeof(Node->m_IsDir));
+                file->Write((char*)&Node->m_Created, sizeof(Node->m_Created));
+                file->Write((char*)&Node->m_Accessed, sizeof(Node->m_Accessed));
+
+                if(Node->IsDir())
+                {
+                    auto Dir = static_cast<CVFSDir*>(Node);
+                    auto Childs = Dir->GetChilds();
+
+                    //Adds the count of entries.
+                    uint64_t EntryCount = Childs.size();
+                    file->Write((char*)&EntryCount, sizeof(EntryCount));
+
+                    int FillSize = DISK_CHUNK_SIZE - (NodeSize + sizeof(uint64_t));
+                    FillSpace(file, FillSize);
+                    for (auto e : Childs)
+                        SerializeNode(file, e.get());
+                }
+                else
+                {
+                    auto NodeFile = static_cast<CVFSFile*>(Node);
+
+                    time_t mtime = NodeFile->Modified();
+                    file->Write((char*)&mtime, sizeof(mtime));
+
+                    uint64_t Size = NodeFile->Size();
+                    file->Write((char*)&Size, sizeof(Size));
+
+                    NodeSize += sizeof(mtime) + sizeof(Size);
+
+                    //If the data fits into the chunk, write it into the current chunk.
+                    int FillSize = DISK_CHUNK_SIZE - (NodeSize > DISK_CHUNK_SIZE ? (NodeSize - DISK_CHUNK_SIZE) : NodeSize);
+                    if(NodeFile->Size() <= FillSize)
+                    {
+                        file->Write(NodeFile->m_Data[0]->Data, NodeFile->m_Data[0]->Filled);
+                        FillSize -= NodeFile->Size();
+                    }
+
+                    FillSpace(file, FillSize);
+                    if(NodeFile->Size() > FillSize)
+                    {
+                        FillSize = DISK_CHUNK_SIZE - (NodeFile->Size() % DISK_CHUNK_SIZE);
+
+                        for (auto e : NodeFile->m_Data)
+                        {
+                            if(e->Filled == 0)
+                                break;
+
+                            file->Write(e->Data, e->Filled);
+                        }
+
+                        if(FillSize < DISK_CHUNK_SIZE)
+                            FillSpace(file, FillSize);
+                    }
+                }
+            }
+
+            VFSNode DeserializeNode(const std::vector<char> &Data, size_t &Pos)
+            {
+                std::string Identifier(NODE_IDENTIFIER.size(), '\0');
+                ReadVector(Data, &Identifier[0], Identifier.size(), Pos);
+                if(Identifier != NODE_IDENTIFIER)
+                    throw CVFSException("Invalied node identifier!", VFSError::CANT_CREATE_FILESYSTEM);
+
+                int NameSize = 0;
+                ReadVector(Data, (char*)&NameSize, sizeof(NameSize), Pos); 
+
+                std::string Name(NameSize, '\0');
+                ReadVector(Data, &Name[0], Name.size(), Pos);
+
+                bool IsDir;
+                ReadVector(Data, (char*)&IsDir, sizeof(IsDir), Pos); 
+
+                time_t Created;
+                time_t Accessed;
+                ReadVector(Data, (char*)&Created, sizeof(Created), Pos); 
+                ReadVector(Data, (char*)&Accessed, sizeof(Accessed), Pos); 
+
+                if(IsDir)
+                {
+                    auto Dir = VFSDir(new CVFSDir(Name));
+                    Dir->m_Created = Created;
+                    Dir->m_Accessed = Accessed;
+
+                    uint64_t Entries = 0;
+                    ReadVector(Data, (char*)&Entries, sizeof(Entries), Pos); 
+
+                    size_t NodeSize = NODE_IDENTIFIER.size() + sizeof(int) + (int)Dir->m_Name.size() + sizeof(Dir->m_IsDir) + sizeof(Dir->m_Created) + sizeof(Dir->m_Accessed) + sizeof(uint64_t);
+
+                    //Skips the Padding
+                    Pos += DISK_CHUNK_SIZE - NodeSize;
+
+                    for (size_t i = 0; i < Entries; i++)
+                        Dir->AppendChild(DeserializeNode(Data, Pos));
+            
+                    return Dir;
+                }
+                else
+                {
+                    auto File = VFSFile(new CVFSFile(Name));
+
+                    time_t mtime;
+                    ReadVector(Data, (char*)&mtime, sizeof(mtime), Pos); 
+
+                    File->m_Created = Created;
+                    File->m_Accessed = Accessed;
+                    File->m_Modified = mtime;
+
+                    uint64_t Size;
+                    ReadVector(Data, (char*)&Size, sizeof(Size), Pos);
+
+                    size_t NodeSize = NODE_IDENTIFIER.size() + sizeof(int) + (int)File->m_Name.size() + sizeof(File->m_IsDir) + sizeof(File->m_Created) + sizeof(File->m_Accessed) + sizeof(mtime) + sizeof(Size);
+                    int FillSize = DISK_CHUNK_SIZE - (NodeSize > DISK_CHUNK_SIZE ? (NodeSize - DISK_CHUNK_SIZE) : NodeSize);
+
+                    //Skips the Padding.
+                    if(Size > FillSize)
+                        Pos += FillSize;
+
+                    std::string Buf(Size, '\0');
+                    ReadVector(Data, &Buf[0], Buf.size(), Pos);
+                    File->Write(Buf.data(), Buf.size());
+
+                    //Skips the Padding.
+                    if(Size <= FillSize)
+                        Pos += FillSize - Size;
+                    else
+                        Pos += DISK_CHUNK_SIZE - (Size % DISK_CHUNK_SIZE);
+
+                    return File;
+                }
+            }
+
             VFSDir m_Root;
     };
 
